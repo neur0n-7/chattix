@@ -1,0 +1,133 @@
+<!-- templates/chat.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Room {{ room_code }}</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+</head>
+<body class="bg-light">
+  <div class="container py-4">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <h4>Room: <span class="badge bg-secondary">{{ room_code }}</span></h4>
+      <div><strong>{{ username }}</strong></div>
+    </div>
+
+    <div id="messages" class="border bg-white p-3 mb-3" style="height: 360px; overflow-y:auto;"></div>
+
+    <form id="msgForm" class="d-flex gap-2">
+      <input id="msgInput" class="form-control" placeholder="Type a message..." autocomplete="off" required>
+      <button class="btn btn-primary">Send</button>
+    </form>
+  </div>
+
+<script>
+(async () => {
+  const socket = io();
+  const room = "{{ room_code }}";
+  const username = "{{ username }}";
+  const encText = (s) => btoa(unescape(encodeURIComponent(s)));
+  const decText = (s) => decodeURIComponent(escape(atob(s)));
+
+  function abToBase64(buf){ return btoa(String.fromCharCode(...new Uint8Array(buf))); }
+  function base64ToAb(b64){ const bin = atob(b64); const len = bin.length; const arr = new Uint8Array(len); for (let i=0;i<len;i++) arr[i]=bin.charCodeAt(i); return arr.buffer; }
+
+  // UI helpers
+  function addMessage(html){
+    const div = document.createElement('div');
+    div.innerHTML = html;
+    document.getElementById('messages').appendChild(div);
+    document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+  }
+
+  // join room (server will send ciphertext history)
+  socket.emit('join', { room });
+
+  // generate RSA key pair in browser (RSA-OAEP SHA-256)
+  const keyPair = await window.crypto.subtle.generateKey(
+    { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1,0,1]), hash: "SHA-256" },
+    true,
+    ["encrypt","decrypt"]
+  );
+
+  // export public key as SPKI DER and send to server (base64)
+  const spki = await window.crypto.subtle.exportKey('spki', keyPair.publicKey);
+  const spki_b64 = abToBase64(spki);
+  socket.emit('register_key', { room, public_key: spki_b64 });
+
+  // variable to hold imported AES key (CryptoKey)
+  let aesKey = null;
+
+  // receive encrypted AES key from server -> decrypt with RSA private key -> import AES key
+  socket.on('encrypted_key', async (data) => {
+    try {
+      const enc_b64 = data.enc_key;
+      const enc_ab = base64ToAb(enc_b64);
+      const raw_aes = await window.crypto.subtle.decrypt({ name: "RSA-OAEP" }, keyPair.privateKey, enc_ab);
+      // import AES raw key
+      aesKey = await window.crypto.subtle.importKey("raw", raw_aes, { name: "AES-GCM" }, false, ["encrypt","decrypt"]);
+      addMessage(`<div class="text-success"><em>Encryption ready (AES key loaded).</em></div>`);
+    } catch (e) {
+      console.error("Failed to decrypt AES key:", e);
+      addMessage(`<div class="text-danger"><em>Failed to obtain encryption key.</em></div>`);
+    }
+  });
+
+  // receive ciphertext messages (JSON string) from server
+  socket.on('message', async (payload) => {
+    // payload is a JSON string: {"iv":"...","ct":"...","meta":"optional meta like username only if you include it"}
+    try {
+      // Display as info while no key
+      if (!aesKey) {
+        addMessage(`<div class="text-muted small">[encrypted] ${payload}</div>`);
+        return;
+      }
+      const obj = JSON.parse(payload);
+      const iv_ab = base64ToAb(obj.iv);
+      const ct_ab = base64ToAb(obj.ct);
+      const plain_ab = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(iv_ab) }, aesKey, ct_ab);
+      const decoder = new TextDecoder();
+      const plain = decoder.decode(plain_ab);
+      addMessage(`<div>${plain}</div>`);
+    } catch (e) {
+      console.error("decrypt msg failed", e);
+      addMessage(`<div class="text-muted small">[unable to decrypt message]</div>`);
+    }
+  });
+
+  socket.on('status', (msg) => addMessage(`<div class="text-muted"><em>${msg}</em></div>`));
+
+  // form send -> encrypt with AES-GCM, send JSON with base64 iv & ct
+  document.getElementById('msgForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const input = document.getElementById('msgInput');
+    const text = input.value.trim();
+    if (!text) return;
+    if (!aesKey) { addMessage(`<div class="text-warning"><em>Encryption not ready yet.</em></div>`); return; }
+
+    // include username plain in the plaintext so recipients see who sent it
+    const payloadPlain = `${username}: ${text}`;
+    const encoder = new TextEncoder();
+    const data = encoder.encode(payloadPlain);
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const ct = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, data);
+
+    const iv_b64 = abToBase64(iv.buffer);
+    const ct_b64 = abToBase64(ct);
+    const msgPayload = JSON.stringify({ iv: iv_b64, ct: ct_b64 });
+
+    // send ciphertext to server (server stores and broadcasts it)
+    socket.emit('message', { room, payload: msgPayload });
+
+    input.value = '';
+  });
+
+  // notify server when leaving
+  window.addEventListener('beforeunload', () => {
+    socket.emit('leave', { room });
+  });
+})();
+</script>
+</body>
+</html>
