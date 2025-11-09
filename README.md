@@ -13,15 +13,6 @@
 
 ## Setup
 
-### Requirements
-
-- Python 3.8+
-- Flask
-- Flask-SocketIO
-- cryptography
-
-### Install
-
 ```bash
 # Clone repository
 git clone https://github.com/your-username/chattix.git
